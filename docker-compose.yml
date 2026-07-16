@@ -1,0 +1,167 @@
+version: '3.8'
+
+services:
+  # ==========================================
+  # 1. DATA & INFRASTRUCTURE LAYER
+  # ==========================================
+  postgres:
+    image: postgres:15-alpine
+    container_name: appsec_postgres
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: pass
+      POSTGRES_DB: appsec_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Opsional: Mount schema.sql untuk inisialisasi otomatis
+      - ./platform/storage/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d appsec_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: appsec_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  minio:
+    image: minio/minio:latest
+    container_name: appsec_minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: password123
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: appsec_qdrant
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: appsec_ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+      - ./platform/ai/models:/models
+    # Jika Anda memiliki GPU NVIDIA, hapus komentar di bawah ini:
+    deploy:
+       resources:
+         reservations:
+           devices:
+             - driver: nvidia
+               count: 1
+               capabilities: [gpu]
+
+  # ==========================================
+  # 2. APPLICATION SERVICES LAYER
+  # ==========================================
+  gateway_api:
+    build: 
+      context: .
+      dockerfile: Dockerfile.gateway # Anda perlu membuat Dockerfile sederhana untuk ini
+    container_name: appsec_gateway
+    command: uvicorn platform.gateway.api.routes:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - redis
+
+  backend_api:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: appsec_backend
+    command: uvicorn platform.backend.api.routes.review:router --host 0.0.0.0 --port 8080
+    ports:
+      - "8080:8080"
+    environment:
+      - PG_DSN=postgresql://user:pass@postgres:5432/appsec_db
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ==========================================
+  # 3. ASYNCHRONOUS WORKERS
+  # ==========================================
+  worker_ingestor:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: appsec_worker_ingestor
+    command: python -m platform.worker.main
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - PG_DSN=postgresql://user:pass@postgres:5432/appsec_db
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=admin
+      - MINIO_SECRET_KEY=password123
+    depends_on:
+      postgres:
+        condition: service_healthy
+      - redis
+      - minio
+
+  worker_ai:
+    build:
+      context: .
+      dockerfile: Dockerfile.ai
+    container_name: appsec_worker_ai
+    command: python -m platform.ai.worker
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - PG_DSN=postgresql://user:pass@postgres:5432/appsec_db
+      - OLLAMA_HOST=http://ollama:11434
+      - QDRANT_URL=http://qdrant:6333
+    depends_on:
+      postgres:
+        condition: service_healthy
+      - redis
+      - ollama
+      - qdrant
+
+  worker_orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile.orchestrator
+    container_name: appsec_worker_orchestrator
+    command: python -m platform.orchestrator.worker
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - GATEWAY_URL=http://gateway_api:8000/api/ingest
+    volumes:
+      - orchestrator_workspace:/tmp/appsec_workspace
+      # Mem-mounting socket docker jika orchestrator perlu memutar container scanner
+      - /var/run/docker.sock:/var/run/docker.sock 
+    depends_on:
+      - redis
+      - gateway_api
+
+# ==========================================
+# 4. PERSISTENT VOLUMES
+# ==========================================
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  qdrant_data:
+  ollama_data:
+  orchestrator_workspace:
