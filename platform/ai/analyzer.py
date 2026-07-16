@@ -1,51 +1,84 @@
 import httpx
-import json
 import structlog
-from typing import Dict, Any
+from core.config import settings
 
 logger = structlog.get_logger()
 
 class MultiAgentAnalyzer:
-    def __init__(self, ollama_host: str = "http://localhost:11434"):
-        self.ollama_url = ollama_host
-        self.logger = logger.bind(service="multi_agent_analyzer")
+    def __init__(self, ollama_host: str):
+        self.ollama_url = f"{ollama_host}/api/generate"
+        # Menggunakan Llama 3 seperti yang disebutkan di arsitektur
+        self.model = "llama3" 
 
-    async def _call_agent(self, agent_name: str, prompt_data: str) -> Dict[str, Any]:
-        """Memanggil agen Ollama tertentu dengan format JSON."""
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"{self.ollama_url}/api/generate",
-                json={
-                    "model": agent_name, # Memanggil 'ornith' atau 'qwythos'
-                    "prompt": prompt_data,
-                    "format": "json", 
-                    "stream": False
-                },
-                timeout=300.0 # Timeout lebih panjang untuk LLM
-            )
+    async def _call_ollama(self, prompt: str) -> str:
+        """Fungsi bantuan untuk memanggil Ollama API."""
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(self.ollama_url, json={
+                "model": self.model,
+                "prompt": prompt,
+                "stream": False
+            })
             response.raise_for_status()
-            raw_text = response.json()["response"]
-            return json.loads(raw_text)
+            return response.json().get("response", "")
 
-    async def run_full_analysis(self, finding_data: Dict[str, Any], retrieved_context: str) -> Dict[str, Any]:
-        title = finding_data.get('title', 'Unknown')
+    async def run_full_analysis(self, finding_payload: dict, context_data: str) -> dict:
+        """
+        Menjalankan analisis multi-agen:
+        1. Ornith (Triage & False Positive Check)
+        2. Qwythos (Root Cause & Remediation)
+        """
+        fingerprint = finding_payload.get("fingerprint")
+        file_path = finding_payload.get("evidence", {}).get("location", {}).get("file_path", "Unknown File")
         
-        # Susun data mentah untuk dikirim ke agen
-        payload = f"TITLE: {title}\nDESC: {finding_data.get('description', '')}\nCONTEXT: {retrieved_context}"
+        logger.info("starting_ai_analysis", fingerprint=fingerprint)
+
+        # 1. Agen Ornith: Triage
+        triage_prompt = f"""
+        Anda adalah agen keamanan siber 'Ornith'. Tugas Anda adalah menilai temuan keamanan.
+        Berikut konteks kode terkait:
+        --- KODE ---
+        {context_data}
+        ---------------
+        Lokasi File: {file_path}
         
-        # 1. Eksekusi Agen Ornith (Triage)
-        self.logger.info("running_ornith_triage", finding_title=title)
-        triage_result = await self._call_agent("ornith", payload)
-        
-        remediation_result = None
-        
-        # 2. Jika valid, Eksekusi Agen Qwythos (PoC & Remediasi)
-        if not triage_result.get("is_false_positive", True):
-            self.logger.info("running_qwythos_remediation", finding_title=title)
-            poc_payload = f"TITLE: {title}\nROOT CAUSE: {triage_result.get('root_cause_analysis', '')}\nCONTEXT: {retrieved_context}"
-            remediation_result = await self._call_agent("qwythos", poc_payload)
+        Apakah temuan ini kemungkinan besar FALSE POSITIVE? Jawab hanya dengan 'YA' atau 'TIDAK', lalu berikan alasan singkat dalam 1 kalimat.
+        Format: [YA/TIDAK] - [Alasan]
+        """
+        triage_response = await self._call_ollama(triage_prompt)
+        is_fp = "YA" in triage_response.upper().split()[0]
+
+        # 2. Agen Qwythos: Root Cause & Remediation
+        if not is_fp:
+            remediation_prompt = f"""
+            Anda adalah agen keamanan siber 'Qwythos'. Tugas Anda adalah menganalisis akar masalah dan memberikan rekomendasi perbaikan dan exploit.
+            Konteks kode:
+            --- KODE ---
+            {context_data}
+            ---------------
+            Berikan output dalam format JSON Valid (tanpa markdown) dengan kunci berikut:
+            - "root_cause": (string) Penjelasan teknis mengapa kode ini rentan.
+            - "risk_level": (string) Salah satu dari: CRITICAL, HIGH, MEDIUM, LOW.
+            - "remediation": (string) Langkah spesifik cara memperbaiki kode tersebut dan exploit.
+            """
+            qwythos_response = await self._call_ollama(remediation_prompt)
             
+            # Fallback sederhana jika LLM gagal mengembalikan JSON yang bersih
+            try:
+                import json
+                qwythos_data = json.loads(qwythos_response.replace("```json", "").replace("```", ""))
+            except:
+                qwythos_data = {
+                    "root_cause": qwythos_response[:200],
+                    "risk_level": "MEDIUM",
+                    "remediation": "Perlu analisis manual lebih lanjut."
+                }
+        else:
+            qwythos_data = {"root_cause": None, "risk_level": "INFO", "remediation": None}
+
         return {
-            "triage": triage_result,
-            "remediation": remediation_result
+            "triage": {
+                "is_false_positive": is_fp,
+                "reason": triage_response
+            },
+            "analysis": qwythos_data
         }

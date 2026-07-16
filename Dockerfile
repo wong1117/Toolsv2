@@ -1,30 +1,45 @@
 # Menggunakan image Python yang ringan
 FROM python:3.11-slim
 
-# Mencegah Python menulis file .pyc dan memastikan output log langsung tampil
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
 
-# Mengatur direktori kerja di dalam container
 WORKDIR /app
 
-# Menginstal dependensi sistem operasi yang dibutuhkan (termasuk git untuk Orchestrator)
+# 1. Install dependencies sistem & Download Binary External Tools
 RUN apt-get update && apt-get install -y \
     build-essential \
     libpq-dev \
     git \
+    wget \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Menyalin file requirements terlebih dahulu untuk memanfaatkan Docker Cache
+# Install Semgrep & Checkov via Pip
+RUN pip install --no-cache-dir semgrep checkov
+
+# Download & Install Trivy
+RUN wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | gpg --dearmor -o /usr/share/keyrings/trivy.gpg && \
+    echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb $(. /etc/os-release && echo $VERSION_CODENAME) main" | tee /etc/apt/sources.list.d/trivy.list && \
+    apt-get update && apt-get install -y trivy
+
+# Download & Install Gitleaks
+RUN wget -qO /usr/local/bin/gitleaks https://github.com/gitleaks/gitleaks/releases/download/v8.18.2/gitleaks_8.18.2_linux_x64.tar.gz && \
+    tar -xzf /usr/local/bin/gitleaks -C /usr/local/bin gitleaks && \
+    chmod +x /usr/local/bin/gitleaks && \
+    rm /usr/local/bin/gitleaks
+
+# Download & Install Dockle (Container Linter)
+RUN wget -qO /usr/local/bin/dockle https://github.com/goodwithtech/dockle/releases/download/v0.4.14/dockle_0.4.14_Linux-64bit.tar.gz && \
+    tar -xzf /usr/local/bin/dockle -C /usr/local/bin dockle && \
+    chmod +x /usr/local/bin/dockle && \
+    rm /usr/local/bin/dockle
+
+# 2. Install Python dependencies
 COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
 
-# Menginstal pustaka Python
-RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r requirements.txt
-
-# Menyalin seluruh kode sumber platform ke dalam container
+# 3. Copy source code
 COPY ./platform ./platform
-
-# Catatan: Kita tidak mendefinisikan CMD atau ENTRYPOINT di sini.
-# Perintah eksekusi (uvicorn / python -m) akan diatur oleh docker-compose.yml

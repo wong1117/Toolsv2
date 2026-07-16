@@ -1,121 +1,69 @@
-from fastapi import APIRouter, HTTPException, Depends, Query
+from fastapi import APIRouter, Query
 import asyncpg
-import structlog
+from core.config import settings
 from typing import Optional
 
-# Asumsi impor model dari modul internal
-from models.review import ReviewSubmission
-from auth.dependencies import RequireRole
-from auth.schemas import RoleEnum, TokenData
+router = APIRouter(prefix="/api/review", tags=["Human Review"])
 
-router = APIRouter(prefix="/api/reviews", tags=["Human Review"])
-logger = structlog.get_logger()
+@router.on_event("startup")
+async def startup_event():
+    router.db_pool = await asyncpg.create_pool(dsn=settings.PG_DSN)
 
-# Dependensi koneksi database 
-# (Dalam lingkungan produksi, ini mengambil koneksi dari Connection Pool aplikasi)
-async def get_db():
-    # Contoh koneksi statis untuk demonstrasi. 
-    # Pada praktiknya, gunakan app.state.db_pool.acquire()
-    conn = await asyncpg.connect("postgresql://user:pass@postgres:5432/appsec_db")
-    try:
-        yield conn
-    finally:
-        await conn.close()
-
-@router.get("/pending")
-async def get_pending_reviews(
-    page: int = Query(1, ge=1, description="Nomor halaman"),
-    page_size: int = Query(20, ge=1, le=100, description="Jumlah data per halaman"),
-    # Minimal VIEWER bisa melihat antrean
-    current_user: TokenData = Depends(RequireRole(RoleEnum.VIEWER)),
-    conn: asyncpg.Connection = Depends(get_db)
+@router.get("/findings")
+async def get_findings(
+    status: Optional[str] = Query(None, description="Filter by status: needs_review, false_positive, confirmed"),
+    limit: int = Query(50, le=100)
 ):
-    """Mengambil semua temuan yang telah dianalisis AI dan menunggu tinjauan manusia."""
-    offset = (page - 1) * page_size
-    
-    # Query data dengan pagination
-    records = await conn.fetch("""
-        SELECT id, fingerprint, title, severity, status, created_at 
-        FROM findings 
-        WHERE status = 'needs_review'
-        ORDER BY severity DESC, created_at ASC
-        LIMIT $1 OFFSET $2
-    """, page_size, offset)
-    
-    # Hitung total data untuk keperluan pagination di Frontend
-    total_count = await conn.fetchval("SELECT COUNT(*) FROM findings WHERE status = 'needs_review'")
-    
-    return {
-        "total": total_count,
-        "page": page,
-        "page_size": page_size,
-        "pending_reviews": [dict(r) for r in records]
-    }
-
-@router.get("/{finding_id}")
-async def get_review_details(
-    finding_id: str, 
-    current_user: TokenData = Depends(RequireRole(RoleEnum.VIEWER)),
-    conn: asyncpg.Connection = Depends(get_db)
-):
-    """Mengambil detail lengkap finding termasuk data dari tabel ai_analyses terpisah."""
-    # LEFT JOIN untuk memastikan finding tetap muncul meskipun belum selesai dianalisis AI
-    record = await conn.fetchrow("""
-        SELECT 
-            f.id, f.fingerprint, f.title, f.severity, f.status, f.artifact_id,
-            a.agent_name, a.confidence_score, a.is_false_positive, a.root_cause_analysis, a.remediation_steps
+    """
+    Mengambil daftar temuan untuk Human Review Queue.
+    Sesuai workflow, ini menampilkan temuan beserta output AI.
+    """
+    query = """
+        SELECT f.fingerprint, f.title, f.severity, f.status, f.created_at, f.ai_analysis
         FROM findings f
-        LEFT JOIN ai_analyses a ON f.id = a.finding_id
-        WHERE f.id = $1
-        ORDER BY a.analyzed_at DESC
-        LIMIT 1
-    """, finding_id)
-    
-    if not record:
-        raise HTTPException(status_code=404, detail="Finding not found")
+        WHERE ($1::text IS NULL OR f.status::text = $1)
+        ORDER BY f.created_at DESC
+        LIMIT $2;
+    """
+    async with router.db_pool.acquire() as conn:
+        rows = await conn.fetch(query, status, limit)
         
-    return dict(record)
+    findings = []
+    for row in rows:
+        findings.append({
+            "fingerprint": row["fingerprint"],
+            "title": row["title"],
+            "severity": row["severity"],
+            "status": row["status"],
+            "created_at": str(row["created_at"]),
+            "ai_analysis": row["ai_analysis"]  # Sudah berisi JSON hasil kerja AI Worker
+        })
+        
+    return {"total": len(findings), "data": findings}
 
-@router.post("/{finding_id}/verify")
-async def verify_finding(
-    finding_id: str, 
-    submission: ReviewSubmission,
-    # HANYA ANALYST (atau Lead/Admin) yang boleh memverifikasi kerentanan
-    current_user: TokenData = Depends(RequireRole(RoleEnum.ANALYST)), 
-    conn: asyncpg.Connection = Depends(get_db)
-):
-    """Memproses keputusan akhir dari analis keamanan dan mencatat Audit Log."""
+@router.post("/findings/{fingerprint}/verify")
+async def verify_finding(fingerprint: str, payload: dict):
+    """
+    Endpoint untuk manusia memverifikasi temuan.
+    Sesuai workflow: Human Review -> Report & Remediation
+    """
+    new_status = payload.get("status", "confirmed") # confirmed, fixed, accepted_risk
+    reviewer_notes = payload.get("notes", "")
     
-    # Validasi otorisasi payload vs token (mencegah pemalsuan identitas review)
-    if str(current_user.user_id) != submission.analyst_id:
-         raise HTTPException(status_code=403, detail="Cannot submit review on behalf of another analyst")
-         
-    log = logger.bind(finding_id=finding_id, analyst_id=submission.analyst_id)
-    
-    # Menjalankan update dan logging dalam satu transaksi atomik
-    async with conn.transaction():
-        # 1. Pastikan finding ada dan kuncinya untuk mencegah Race Condition (FOR UPDATE)
-        current_status = await conn.fetchval(
-            "SELECT status FROM findings WHERE id = $1 FOR UPDATE", finding_id
+    async with router.db_pool.acquire() as conn:
+        # Ambil status lama untuk audit log
+        old_status = await conn.fetchval("SELECT status FROM findings WHERE fingerprint = $1", fingerprint)
+        
+        # Update status
+        await conn.execute(
+            "UPDATE findings SET status = $1, updated_at = NOW() WHERE fingerprint = $2",
+            new_status, fingerprint
         )
         
-        if not current_status:
-            raise HTTPException(status_code=404, detail="Finding not found")
-        if current_status != 'needs_review':
-            raise HTTPException(status_code=400, detail=f"Finding is currently '{current_status}', expected 'needs_review'")
-
-        # 2. Perbarui status finding
+        # Tulis ke Audit Log
         await conn.execute("""
-            UPDATE findings 
-            SET status = $1, updated_at = NOW() 
-            WHERE id = $2
-        """, submission.action.value, finding_id)
+            INSERT INTO audit_logs (fingerprint, previous_status, new_status, changed_by, notes)
+            VALUES ($1, $2, $3, 'human-analyst', $4)
+        """, fingerprint, old_status, new_status, reviewer_notes)
         
-        # 3. Catat rekam jejak audit (Audit Trail)
-        await conn.execute("""
-            INSERT INTO audit_logs (finding_id, actor_id, actor_type, previous_status, new_status, comment)
-            VALUES ($1, $2, 'human_analyst', $3, $4, $5)
-        """, finding_id, str(current_user.user_id), current_status, submission.action.value, submission.notes)
-        
-    log.info("finding_reviewed_by_human", action=submission.action.value)
-    return {"status": "success", "message": "Review submitted successfully"}
+    return {"status": "updated", "fingerprint": fingerprint, "new_status": new_status}
