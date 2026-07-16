@@ -1,10 +1,9 @@
-```
-# Multi-Agent AppSec Automation Platform
-
 ![Platform Status](https://img.shields.io/badge/Status-Core_Ready-brightgreen)
 ![Python](https://img.shields.io/badge/Python-3.11-blue)
 ![Docker](https://img.shields.io/badge/Docker-Compose-2496ED)
 ![AI Engine](https://img.shields.io/badge/AI-Llama_3_&_RAG-orange)
+```
+# Multi-Agent AppSec Automation Platform
 
 Platform otomasi keamanan aplikasi terpusat yang mengimplementasikan arsitektur *microservices*, *Retrieval-Augmented Generation* (RAG), dan agen AI lokal (Ornith & Qwythos) untuk melakukan triase, verifikasi, dan remediasi temuan pemindai keamanan secara asinkron.
 
