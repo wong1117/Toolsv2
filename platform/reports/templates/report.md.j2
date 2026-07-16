@@ -1,0 +1,29 @@
+# Laporan Audit Keamanan Aplikasi
+
+**Target ID:** {{ target_url }}
+**Tanggal Laporan:** {{ generated_at.strftime('%Y-%m-%d %H:%M:%S') }}
+**Total Temuan Terkonfirmasi:** {{ total_findings }}
+
+---
+
+## Ringkasan Eksekutif
+Berdasarkan hasil pemindaian dan verifikasi analitis, ditemukan **{{ total_findings }}** kerentanan yang memerlukan perhatian segera oleh tim pengembang.
+
+---
+
+## Detail Kerentanan
+
+{% for finding in findings %}
+### [{{ finding.severity | upper }}] {{ finding.title }}
+**Finding ID:** `{{ finding.id }}`
+
+#### Akar Masalah (Root Cause)
+{{ finding.root_cause }}
+
+#### Rekomendasi Perbaikan (Remediation)
+{% for step in finding.remediation_steps %}
+- {{ step }}
+{% endfor %}
+
+---
+{% endfor %}
